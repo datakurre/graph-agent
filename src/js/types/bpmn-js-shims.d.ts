@@ -1,5 +1,5 @@
 // bpmn-js and its ecosystem (bpmn-js-properties-panel, zeebe-bpmn-moddle,
-// bpmn-auto-layout, diagram-js-minimap) ship no type declarations at all, and no
+// diagram-js-minimap) ship no type declarations at all, and no
 // `@types/*` package exists for them. These shims type only the surface this
 // project actually calls; everything else is intentionally `any` rather than
 // a fabricated, likely-wrong signature.
@@ -30,10 +30,6 @@ declare module "zeebe-bpmn-moddle/resources/zeebe.json" {
   import type { ModdleDescriptor } from "../lib/moddle-types";
   const zeebeModdleDescriptor: ModdleDescriptor;
   export default zeebeModdleDescriptor;
-}
-
-declare module "bpmn-auto-layout" {
-  export function layoutProcess(xml: string): Promise<string>;
 }
 
 declare module "bpmn-js/lib/util/ModelUtil" {
