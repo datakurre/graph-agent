@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, beforeEach } from "vitest";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
@@ -884,5 +884,80 @@ describe("resume restores the Pi transcript (issue #115)", () => {
     store.create(project);
     store.writeTranscript([{ role: "user", content: "a" }, { role: "user", content: "b" }]);
     expect(() => store.writeTranscript([{ role: "user", content: "b" }])).toThrow(/refusing to overwrite/);
+  });
+});
+
+describe("checkpoints after every activity (issue #116)", () => {
+  const NS =
+    'xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"';
+  const turn = (id: string, prompt: string, from: string, to: string) =>
+    `<bpmn:serviceTask id="${id}"><bpmn:extensionElements><zeebe:taskDefinition type="agent:turn" />
+      <zeebe:ioMapping><zeebe:input source="=&quot;${prompt}&quot;" target="prompt" /></zeebe:ioMapping></bpmn:extensionElements>
+      <bpmn:incoming>${from}</bpmn:incoming><bpmn:outgoing>${to}</bpmn:outgoing></bpmn:serviceTask>`;
+  const three = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions id="Defs_three" ${NS}>
+  <bpmn:process id="three" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="turn1" />
+    ${turn("turn1", "p1", "f1", "f2")}
+    <bpmn:sequenceFlow id="f2" sourceRef="turn1" targetRef="turn2" />
+    ${turn("turn2", "p2", "f2", "f3")}
+    <bpmn:sequenceFlow id="f3" sourceRef="turn2" targetRef="turn3" />
+    ${turn("turn3", "p3", "f3", "f4")}
+    <bpmn:sequenceFlow id="f4" sourceRef="turn3" targetRef="end" />
+    <bpmn:endEvent id="end"><bpmn:incoming>f4</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+  it("has turn1 on disk while turn2 runs, and a snapshot from then resumes without re-sending turn1", async () => {
+    const graphPath = join(home, "three.bpmn");
+    writeFileSync(graphPath, three);
+    const say = (t: string) => fauxAssistantMessage([fauxText(t)], { stopReason: "stop" });
+    let snapshot: { id: string } | undefined;
+    let onDisk: { transcript: number; state: boolean } | undefined;
+    const faux = scripted([say("a"), say("b"), say("c")]);
+    const first = await runSession(
+      options(faux, {
+        graphPath,
+        prompt: "go",
+        onActivity: (a: { activityId: string }) => {
+          if (a.activityId !== "turn2") return;
+          const sid = readdirSync(paths.sessionsDir)[0]!;
+          const dir = join(paths.sessionsDir, sid);
+          onDisk = {
+            transcript: new SessionStore(paths, sid).readTranscript().length,
+            state: existsSync(join(dir, "engine.json")),
+          };
+          const copy = join(paths.sessionsDir, "crashed");
+          cpSync(dir, copy, { recursive: true });
+          snapshot = { id: "crashed" };
+        },
+      }),
+    );
+    expect(first.outcome).toBe("completed");
+    // user + assistant of turn1 at minimum
+    expect(onDisk?.transcript).toBeGreaterThanOrEqual(2);
+    expect(onDisk?.state).toBe(true);
+
+    const crashed = new SessionStore(paths, snapshot!.id);
+    crashed.update((m) => {
+      m.id = "crashed";
+      m.status = "running";
+      m.pid = 2 ** 22 - 1;
+    });
+    const requests: unknown[][] = [];
+    const faux2 = scripted([say("b2"), say("c2")]);
+    const second = await resumeSession({
+      ...options(faux2),
+      streamFn: ((m: never, context: { messages: unknown[] }, o: never) => {
+        requests.push([...context.messages]);
+        return faux2.provider.streamSimple(m, context as never, o);
+      }) as RunSessionOptions["streamFn"],
+      sessionId: "crashed",
+    });
+    expect(second.outcome).toBe("completed");
+    // Only the turns after the checkpoint were sent (turn1 was not re-run).
+    expect(requests.length).toBeLessThanOrEqual(2);
+    expect(crashed.readTranscript().length).toBeGreaterThanOrEqual(6);
   });
 });

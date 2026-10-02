@@ -337,6 +337,13 @@ async function drive(
     onExpressionWarning: (warning: { expression: string; message: string }) => {
       options.onProgress?.(`  FEEL warning: ${warning.message} in ${warning.expression}`);
     },
+    // Same order as the end-of-pass write below: transcript, then engine state
+    // (graph revisions are already on disk by the time any later activity ends).
+    // meta.status stays "running"; a killed process reads as "stale" via pid.
+    onCheckpoint: (state: EngineState) => {
+      if (pi.messages.length > 0) store.writeTranscript(pi.messages, { allowShrink: pi.compacted });
+      store.writeEngineState(state);
+    },
     checkStopAfterActivity: () =>
       splicedThisPass || store.readMeta().revisions.length > revisionsAtPassStart,
   };

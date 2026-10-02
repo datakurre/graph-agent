@@ -634,3 +634,45 @@ describe("a callActivity's own zeebe:output (issue #66)", () => {
     expect(visited.has("end_normal")).toBe(false);
   });
 });
+
+describe("onCheckpoint (issue #116)", () => {
+  const task = (id: string, from: string, to: string) =>
+    `<serviceTask id="${id}"><extensionElements><zeebe:taskDefinition type="t" /></extensionElements></serviceTask>`;
+  const chain = `<?xml version="1.0" encoding="UTF-8"?>
+<definitions ${DEFS}>
+  <process id="chain" isExecutable="true">
+    <startEvent id="start" />
+    <sequenceFlow id="f1" sourceRef="start" targetRef="a" />
+    ${task("a", "f1", "f2")}
+    <sequenceFlow id="f2" sourceRef="a" targetRef="b" />
+    ${task("b", "f2", "f3")}
+    <sequenceFlow id="f3" sourceRef="b" targetRef="c" />
+    ${task("c", "f3", "f4")}
+    <sequenceFlow id="f4" sourceRef="c" targetRef="end" />
+    <endEvent id="end" />
+  </process>
+</definitions>`;
+
+  it("runs checkpoints strictly one at a time and settles them before returning", async () => {
+    let running = 0;
+    let maxRunning = 0;
+    let calls = 0;
+    let finished = 0;
+    const result = await runGraph(chain, {
+      harnesses: { t: async () => ok("x") },
+      onCheckpoint: async () => {
+        calls++;
+        running++;
+        maxRunning = Math.max(maxRunning, running);
+        await new Promise((r) => setTimeout(r, 30));
+        running--;
+        finished++;
+      },
+    });
+    expect(result.outcome).toBe("completed");
+    expect(maxRunning).toBe(1);
+    expect(calls).toBeGreaterThanOrEqual(1);
+    // none left in flight when the run returns
+        expect(finished).toBe(calls);
+  });
+});
