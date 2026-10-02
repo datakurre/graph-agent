@@ -21,7 +21,7 @@ import type { ToolExecutor } from "./tool-executor.ts";
 import type { EngineState } from "./graph.ts";
 import type { Paths } from "./paths.ts";
 import type { Model } from "@earendil-works/pi-ai";
-import type { Agent } from "@earendil-works/pi-agent-core";
+import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 
 export interface RunSessionOptions {
   paths: Paths;
@@ -220,6 +220,7 @@ async function drive(
   start: Drive,
 ): Promise<SessionOutcome> {
   let graph = store.currentGraph() ?? "";
+  const priorTranscript = store.readTranscript();
 
   // agent:tool is what actually runs a tool call the model asks for; a graph
   // with no such activity anywhere has nowhere to send one. Pi's tool list is
@@ -242,6 +243,10 @@ async function drive(
     tools: canRunTools ? options.tools.list() : [],
     streamFn: options.streamFn,
     sessionId: store.id,
+    // Empty for a fresh session; on resume this is the conversation so far, so
+    // the model sees what was said before the gate and the final
+    // writeTranscript below rewrites a superset of the file (issue #115).
+    messages: priorTranscript as AgentMessage[],
   });
   options.onSessionReady?.(pi);
 
@@ -429,8 +434,8 @@ async function drive(
     outcome !== "error" ? undefined : result.error?.message ? result.error : new Error(fallbackMessage);
 
   store.writeEngineState(result.state);
-  if (pi.messages.length > 0) {
-    store.writeTranscript(pi.messages);
+  if (pi.messages.length > 0 || priorTranscript.length > 0) {
+    store.writeTranscript(pi.messages, { allowShrink: pi.compacted });
   }
   // A terminal "completed" status is never written backwards. resumeSession
   // already refuses to even start against a completed session, but this is

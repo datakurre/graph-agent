@@ -70,6 +70,16 @@ export interface PiSessionOptions {
   /** Injected so tests can drive a scripted provider. */
   streamFn: ConstructorParameters<typeof Agent>[0]["streamFn"];
   sessionId?: string;
+  /**
+   * A transcript to continue from -- what a resumed session read back from
+   * `session.jsonl`. Pi >= 0.86 keeps the system prompt as a leading
+   * `role: "system"` message and `Agent` only prepends one when
+   * `messages[0]` is not already system, so a transcript saved by an older Pi
+   * (no system message) gets the current prompt prepended, while a newer one
+   * keeps the prompt and tools it started with, which is what the prompt cache
+   * wants.
+   */
+  messages?: AgentMessage[];
 }
 
 interface Parked {
@@ -93,6 +103,16 @@ export class PiSession {
   private lastBatch: ToolOutcome[] = [];
   /** Wakes beginTurn once every tool call of the current turn has parked. */
   private onParked: (() => void) | null = null;
+  /**
+   * Tool calls of a restored transcript's last assistant message that have no
+   * result yet: the session was parked between `agent:turn` and `agent:tool`.
+   * There is no live run holding them, so they are answered by appending the
+   * `toolResult` straight into the transcript.
+   */
+  /** Set once compactHistory has deliberately shortened the transcript. */
+  compacted = false;
+  private readonly dangling = new Map<string, string>();
+  private readonly danglingAnswered = new Set<string>();
 
   constructor(options: PiSessionOptions) {
     this.agent = new Agent({
@@ -105,9 +125,58 @@ export class PiSession {
         systemPrompt: options.systemPrompt,
         model: options.model,
         tools: options.tools.map((spec) => this.parkingTool(spec)),
-        messages: [],
+        messages: options.messages ? [...options.messages] : [],
       },
     });
+    this.collectDangling();
+  }
+
+  private collectDangling(): void {
+    const msgs = this.agent.state.messages;
+    let lastAssistant = -1;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i]?.role === "assistant") {
+        lastAssistant = i;
+        break;
+      }
+    }
+    if (lastAssistant < 0) return;
+    const answered = new Set<string>();
+    for (const m of msgs.slice(lastAssistant + 1)) {
+      if (m.role === "toolResult") answered.add((m as { toolCallId: string }).toolCallId);
+    }
+    const content = (msgs[lastAssistant] as { content?: unknown }).content;
+    if (!Array.isArray(content)) return;
+    for (const block of content as Array<{ type?: string; id?: string; name?: string }>) {
+      if (block.type === "toolCall" && block.id && !answered.has(block.id)) {
+        this.dangling.set(block.id, block.name ?? "");
+      }
+    }
+  }
+
+  /** Append a result for a restored, unanswered tool call. */
+  private answerDangling(toolCallId: string, outcome: ToolOutcome): void {
+    const toolName = this.dangling.get(toolCallId) ?? "";
+    this.dangling.delete(toolCallId);
+    this.danglingAnswered.add(toolCallId);
+    this.agent.state.messages = [
+      ...this.agent.state.messages,
+      {
+        role: "toolResult",
+        toolCallId,
+        toolName,
+        content: [{ type: "text", text: outcome.content }],
+        isError: outcome.isError === true,
+        timestamp: Date.now(),
+      } as AgentMessage,
+    ];
+    this.lastBatch.push(outcome);
+  }
+
+  private failDangling(): void {
+    for (const id of [...this.dangling.keys()]) {
+      this.answerDangling(id, { content: `Tool call ${id} was never executed by the graph.`, isError: true });
+    }
   }
 
   /**
@@ -143,7 +212,7 @@ export class PiSession {
 
   /** Tool calls still waiting for the graph to answer them. */
   get pendingToolCalls(): string[] {
-    return [...this.parked.keys()];
+    return [...this.parked.keys(), ...this.dangling.keys()];
   }
 
   /**
@@ -156,9 +225,11 @@ export class PiSession {
     // here rather than making every graph pair `agent:turn` with
     // `agent:collect-tools`. A run with tool calls still parked is genuinely in
     // flight and must not be trampled.
+    if (!this.run && this.dangling.size > 0) this.failDangling();
     if (this.run && this.parked.size === 0) await this.endTurn();
     if (this.run) throw new Error("a turn is already in flight with unanswered tool calls");
     this.lastBatch = [];
+    this.danglingAnswered.clear();
     this.runError = null;
 
     let sawAssistant = false;
@@ -239,6 +310,7 @@ export class PiSession {
 
   /** Answer one parked tool call. */
   resolveTool(toolCallId: string, outcome: ToolOutcome): void {
+    if (this.dangling.has(toolCallId)) return this.answerDangling(toolCallId, outcome);
     const parked = this.parked.get(toolCallId);
     if (!parked) throw new Error(`no tool call is waiting with id '${toolCallId}'`);
     this.parked.delete(toolCallId);
@@ -251,7 +323,16 @@ export class PiSession {
    * is Pi's rule -- all of them, not any of them.
    */
   async endTurn(): Promise<{ terminate: boolean; toolResults: number }> {
-    if (!this.run) return { terminate: false, toolResults: 0 };
+    if (!this.run) {
+      if (this.dangling.size === 0 && this.danglingAnswered.size === 0) return { terminate: false, toolResults: 0 };
+      this.failDangling();
+      const batch = this.lastBatch;
+      this.danglingAnswered.clear();
+      return {
+        terminate: batch.length > 0 && batch.every((outcome) => outcome.terminate === true),
+        toolResults: batch.length,
+      };
+    }
     // A tool the graph never answered would hang the run; fail it instead.
     this.onParked = null;
     for (const [id, parked] of this.parked) {
@@ -337,6 +418,7 @@ export class PiSession {
       timestamp: Date.now(),
     } as AgentMessage;
 
+    this.compacted = true;
     this.agent.state.messages = [summaryMsg, ...tail];
     const afterCount = this.agent.state.messages.length;
     return { beforeCount, afterCount };

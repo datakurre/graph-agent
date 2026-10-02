@@ -11,7 +11,7 @@ import type { Paths } from "./paths.ts";
  *     engine.json      bpmn-engine state snapshot (source stripped; see graph/)
  *     graph/000.bpmn   graph revisions, oldest first -- the session mutates, so
  *     graph/001.bpmn   every splice lands as a new revision rather than an overwrite
- *     session.jsonl    Pi's own transcript, written by Pi's SessionManager
+ *     session.jsonl    Pi's transcript, written by graph-agent (restored on resume)
  *
  * Ordering matters on write: the transcript is Pi's, the graph revision is ours,
  * and the engine snapshot points at both. Committing them in that order means a
@@ -315,8 +315,18 @@ export class SessionStore {
     writeAtomic(this.enginePath, JSON.stringify(state));
   }
 
-  writeTranscript(messages: readonly unknown[]): void {
+  /**
+   * Never writes less than it reads (issue #115) unless the caller says the
+   * transcript was deliberately compacted.
+   */
+  writeTranscript(messages: readonly unknown[], options: { allowShrink?: boolean } = {}): void {
     mkdirSync(this.dir, { recursive: true });
+    const onDisk = this.readTranscript().length;
+    if (messages.length < onDisk && options.allowShrink !== true) {
+      throw new Error(
+        `refusing to overwrite session.jsonl (${onDisk} messages) with a shorter transcript (${messages.length}): history would be lost`,
+      );
+    }
     const content = messages.map((m) => JSON.stringify(m)).join("\n") + (messages.length > 0 ? "\n" : "");
     writeAtomic(this.transcriptPath, content);
   }

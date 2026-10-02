@@ -289,3 +289,64 @@ describe("PiSession", () => {
     }
   });
 });
+
+describe("PiSession restored from a transcript with unanswered tool calls (issue #115)", () => {
+  function restored(answeredIds: string[] = []) {
+    const faux = scripted([fauxAssistantMessage([fauxText("done")], { stopReason: "stop" })]);
+    const messages: any[] = [
+      { role: "user", content: "go", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "c1", name: "read", arguments: { path: "a" } },
+          { type: "toolCall", id: "c2", name: "bash", arguments: { command: "ls" } },
+        ],
+        stopReason: "toolUse",
+        timestamp: 2,
+      },
+      ...answeredIds.map((id) => ({
+        role: "toolResult",
+        toolCallId: id,
+        toolName: "read",
+        content: [{ type: "text", text: "earlier" }],
+        isError: false,
+        timestamp: 3,
+      })),
+    ];
+    const pi = new PiSession({
+      model: faux.getModel(),
+      systemPrompt: "sys",
+      tools: [
+        { name: "read", description: "r", parameters: { type: "object", additionalProperties: true } },
+        { name: "bash", description: "b", parameters: { type: "object", additionalProperties: true } },
+      ],
+      streamFn: (m, context, options) => faux.provider.streamSimple(m, context, options),
+      messages,
+    });
+    return pi;
+  }
+
+  it("lists dangling ids, answers both, and continues", async () => {
+    const pi = restored();
+    expect(pi.pendingToolCalls.sort()).toEqual(["c1", "c2"]);
+    pi.resolveTool("c1", { content: "A" });
+    pi.resolveTool("c2", { content: "B", isError: true });
+    expect(pi.pendingToolCalls).toEqual([]);
+    const end = await pi.endTurn();
+    expect(end.toolResults).toBe(2);
+    expect(pi.messages.filter((m) => m.role === "toolResult")).toHaveLength(2);
+    const turn = await pi.beginTurn();
+    expect(turn.text).toBe("done");
+    await pi.endTurn();
+  });
+
+  it("fails a never-answered dangling call and only lists the unanswered one", async () => {
+    const pi = restored(["c1"]);
+    expect(pi.pendingToolCalls).toEqual(["c2"]);
+    const end = await pi.endTurn();
+    expect(end.toolResults).toBe(1);
+    const last = pi.messages.at(-1) as any;
+    expect(last.isError).toBe(true);
+    expect(last.content[0].text).toContain("never executed");
+  });
+});

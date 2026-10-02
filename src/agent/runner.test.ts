@@ -813,3 +813,76 @@ describe("steering and follow-up queues (issue #48)", () => {
     expect(store.drainInbox("follow-up")).toEqual([]);
   });
 });
+
+describe("resume restores the Pi transcript (issue #115)", () => {
+  const NS =
+    'xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"';
+  const gated = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions id="Defs_gated" ${NS}>
+  <bpmn:process id="gated" isExecutable="true">
+    <bpmn:extensionElements>
+      <zeebe:userTaskForm id="gate_form">{"components":[{"key":"ok","type":"textfield"}]}</zeebe:userTaskForm>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="turn1" />
+    <bpmn:serviceTask id="turn1"><bpmn:extensionElements><zeebe:taskDefinition type="agent:turn" />
+      <zeebe:ioMapping><zeebe:input source="=prompt" target="prompt" /></zeebe:ioMapping></bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="turn1" targetRef="gate" />
+    <bpmn:userTask id="gate" name="Gate"><bpmn:extensionElements><zeebe:userTask />
+      <zeebe:formDefinition formId="gate_form" /></bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing></bpmn:userTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="gate" targetRef="turn2" />
+    <bpmn:serviceTask id="turn2"><bpmn:extensionElements><zeebe:taskDefinition type="agent:turn" />
+      <zeebe:ioMapping><zeebe:input source="=&quot;second prompt&quot;" target="prompt" /></zeebe:ioMapping></bpmn:extensionElements>
+      <bpmn:incoming>f3</bpmn:incoming><bpmn:outgoing>f4</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f4" sourceRef="turn2" targetRef="end" />
+    <bpmn:endEvent id="end"><bpmn:incoming>f4</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+  function userTexts(messages: unknown[]): string[] {
+    return (messages as Array<{ role: string; content: unknown }>)
+      .filter((m) => m.role === "user")
+      .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)));
+  }
+
+  it("shows the model what was said before the gate, and keeps it on disk", async () => {
+    const graphPath = join(home, "gated.bpmn");
+    writeFileSync(graphPath, gated);
+
+    const first = await runSession(
+      options(scripted([fauxAssistantMessage([fauxText("one")], { stopReason: "stop" })]), {
+        graphPath,
+        prompt: "first prompt",
+        hangGuardMs: 50,
+      }),
+    );
+    expect(first.outcome).toBe("stopped");
+    const store = new SessionStore(paths, first.sessionId);
+    expect(userTexts(store.readTranscript())).toEqual(["first prompt"]);
+
+    const requests: Array<{ messages: unknown[] }> = [];
+    const faux = scripted([fauxAssistantMessage([fauxText("two")], { stopReason: "stop" })]);
+    const second = await resumeSession({
+      ...options(faux, { hangGuardMs: 50 }),
+      streamFn: ((m: never, context: { messages: unknown[] }, o: never) => {
+        requests.push({ messages: [...context.messages] });
+        return faux.provider.streamSimple(m, context as never, o);
+      }) as RunSessionOptions["streamFn"],
+      sessionId: first.sessionId,
+      onWait: () => ({ ok: "1" }),
+    });
+    expect(second.outcome).toBe("completed");
+
+    expect(userTexts(requests[0]!.messages).join("|")).toContain("first prompt");
+    expect(userTexts(store.readTranscript())).toEqual(["first prompt", "second prompt"]);
+  });
+
+  it("writeTranscript refuses to write less than is on disk", () => {
+    const store = new SessionStore(paths, "shrink");
+    store.create(project);
+    store.writeTranscript([{ role: "user", content: "a" }, { role: "user", content: "b" }]);
+    expect(() => store.writeTranscript([{ role: "user", content: "b" }])).toThrow(/refusing to overwrite/);
+  });
+});
