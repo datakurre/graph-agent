@@ -101,7 +101,7 @@ describe("PiSession", () => {
 
     expect(second.text).toBe("Done.");
     const roles = pi.messages.map((m) => (m as { role: string }).role);
-    expect(roles).toEqual(["user", "assistant", "toolResult", "assistant"]);
+    expect(roles).toEqual(["system", "user", "assistant", "toolResult", "assistant"]);
   });
 
   it("keeps the prompt cache warm across turns, which is the whole point", async () => {
@@ -224,14 +224,51 @@ describe("PiSession", () => {
     await pi.beginTurn("Turn 4");
     await pi.endTurn();
 
-    const before = pi.messages.length;
+    const system = pi.messages[0];
+    expect(system?.role).toBe("system");
+    const before = pi.messages.length - 1;
     expect(before).toBeGreaterThan(4);
 
     const res = pi.compactHistory(2);
     expect(res.beforeCount).toBe(before);
     expect(res.afterCount).toBeLessThan(before);
-    expect(pi.messages[0]?.role).toBe("user");
-    expect(String((pi.messages[0] as { content?: string })?.content)).toContain("Compacted conversation history");
+    // The system prompt + tool declarations survive; the summary follows them.
+    expect(pi.messages[0]).toBe(system);
+    expect(pi.agent.state.systemPrompt).toBe("You are a test agent.");
+    expect(pi.messages[1]?.role).toBe("user");
+    expect(String((pi.messages[1] as { content?: string })?.content)).toContain("Compacted conversation history");
+  });
+
+  it("still declares its tools to the model after compaction", async () => {
+    const faux = scripted([
+      fauxAssistantMessage([fauxText("1")]),
+      fauxAssistantMessage([fauxText("2")]),
+      fauxAssistantMessage([fauxText("3")]),
+      fauxAssistantMessage([fauxText("4")]),
+    ]);
+    const seen: Array<{ tools: string[] }> = [];
+    const pi = new PiSession({
+      model: faux.getModel(),
+      systemPrompt: "You are a test agent.",
+      tools: [{ name: "read", description: "Read.", parameters: { type: "object", additionalProperties: true } }],
+      streamFn: (m, context, options) => {
+        const c = context as unknown as { tools?: Array<{ name: string }>; messages: Array<{ role: string; toolsAdded?: Array<{ name: string }> }> };
+        const declared = [
+          ...(c.tools ?? []).map((t) => t.name),
+          ...c.messages.flatMap((msg) => (msg.role === "system" ? (msg.toolsAdded ?? []).map((t) => t.name) : [])),
+        ];
+        seen.push({ tools: declared });
+        return faux.provider.streamSimple(m, context, options);
+      },
+    });
+    for (const p of ["a", "b", "c"]) {
+      await pi.beginTurn(p);
+      await pi.endTurn();
+    }
+    pi.compactHistory(2);
+    await pi.beginTurn("d");
+    await pi.endTurn();
+    expect(seen.at(-1)?.tools).toContain("read");
   });
 
   it("never leaves a toolResult as the first message after compaction (issue #85)", async () => {
@@ -259,6 +296,7 @@ describe("PiSession", () => {
 
     const roles = pi.messages.map((m) => (m as { role: string }).role);
     expect(roles).toEqual([
+      "system",
       "user",
       "assistant",
       "toolResult",
@@ -271,8 +309,9 @@ describe("PiSession", () => {
 
     pi.compactHistory();
 
-    expect(pi.messages[0]?.role).toBe("user");
-    expect(pi.messages[1]?.role).not.toBe("toolResult");
+    expect(pi.messages[0]?.role).toBe("system");
+    expect(pi.messages[1]?.role).toBe("user");
+    expect(pi.messages[2]?.role).not.toBe("toolResult");
     // Every remaining toolResult still has its tool_use in the same (tail)
     // half of the transcript -- not buried inside the summary message.
     const toolUseIds = new Set(

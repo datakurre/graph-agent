@@ -142,7 +142,7 @@ loop-back never run. Three real defects lived there behind a green `make test`
 from the model; #27 a two-call batch running the first call twice) -- all fixed
 now, and `runner.test.ts` covers a two-call batch and a multi-turn tool run.
 The lesson stands: verify anything touching this path against a real model, and
-do it in a **throwaway workspace** -- `createPiToolExecutor` gives the model
+do it in a **throwaway workspace** -- `createPiToolExecutor` (Pi's coding-agent tools) gives the model
 real `read`/`write`/`edit`/`bash` rooted at the cwd, so never run it in this
 checkout.
 

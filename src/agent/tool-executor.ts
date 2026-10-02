@@ -5,8 +5,7 @@
  * so that the graph decides whether each call happens at all. Pi still records
  * the result: see PiSession, where each tool call parks until this returns.
  */
-import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-agent-core";
-import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
+import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import type { ToolOutcome, ToolSpec } from "./pi-session.ts";
 
 export interface ToolExecutor {
@@ -31,22 +30,19 @@ interface HarnessToolLike {
     toolCallId: string,
     params: unknown,
     signal: AbortSignal | undefined,
-    onUpdate: undefined,
-    context: unknown,
-  ): Promise<{ content?: Array<{ type: string; text?: string }>; terminate?: boolean }>;
+    onUpdate?: undefined,
+  ): Promise<{ content?: Array<{ type: string; text?: string }>; terminate?: boolean; isError?: boolean }>;
 }
 
 /** Pi's built-in tools against the real filesystem and shell, rooted at `cwd`. */
 export function createPiToolExecutor(cwd: string): ToolExecutor {
-  const env = new NodeExecutionEnv({ cwd });
-  const context = { env, cwd };
   const tools = new Map<string, HarnessToolLike>(
     (
       [
-        createReadTool(),
-        createWriteTool(),
-        createEditTool(),
-        createBashTool(),
+        createReadTool(cwd),
+        createWriteTool(cwd),
+        createEditTool(cwd),
+        createBashTool(cwd),
       ] as unknown as HarnessToolLike[]
     ).map((tool) => [tool.name, tool]),
   );
@@ -59,12 +55,15 @@ export function createPiToolExecutor(cwd: string): ToolExecutor {
         return { content: `No tool named '${name}' is available.`, isError: true };
       }
       try {
-        const result = await tool.execute(`graph:${name}`, args, signal, undefined, context);
+        const result = await tool.execute(`graph:${name}`, args, signal, undefined);
         return {
           content: (result.content ?? [])
             .filter((block) => block.type === "text")
             .map((block) => block.text ?? "")
             .join("\n"),
+          // The coding-agent tools *return* isError for a failed command (bash
+          // exiting non-zero) rather than throwing.
+          ...(result.isError === true ? { isError: true } : {}),
           ...(result.terminate === true ? { terminate: true } : {}),
         };
       } catch (error) {

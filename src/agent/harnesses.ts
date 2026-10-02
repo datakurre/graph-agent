@@ -395,7 +395,7 @@ export function createHarnesses(deps: HarnessDeps): HarnessRegistry {
   const agentTurn: Harness = async (context) => {
     const prompt = context.input.prompt;
     const raw = typeof prompt === "string" && prompt.length > 0 ? prompt : undefined;
-    if (raw === undefined && pi.messages.length === 0) {
+    if (raw === undefined && !pi.hasConversation) {
       return failed(
         `${context.activityId} starts a turn with nothing to say: map a 'prompt' input, ` +
           `or place it after an activity that has already spoken.`,

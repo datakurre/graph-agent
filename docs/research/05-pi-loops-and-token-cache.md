@@ -26,7 +26,7 @@ The **inner loop** is the turn loop. Each pass:
 6. terminates early only if **every** finalized result in the batch sets
    `terminate` — an all, not an any;
 7. calls `prepareNextTurn`, which may swap context, model or thinking level;
-8. asks `shouldStopAfterTurn`, and exits if it says yes;
+8. asks `shouldStopAfterTurn` (Pi 1.0: `finishTurn`), and exits if it says yes;
 9. re-polls the steering queue and goes round again while there are tool calls or
    pending messages.
 
@@ -38,6 +38,9 @@ Every one of those steps is a callback on `AgentLoopConfig`, and `Agent`
 (`packages/agent/src/agent.ts:173`) exposes them as public, mutable properties.
 Which is why the loop can be handed over without forking anything: set
 `shouldStopAfterTurn` to `() => true` and Pi's loop degenerates to a single turn.
+
+> Pi 1.0 note: `shouldStopAfterTurn` was removed (0.87); graph-agent now passes `finishTurn: async () => ({ action: "end" })`, which has the same effect.
+
 `Agent.prompt()` starts a run; `Agent.continue()` resumes from the current
 transcript. Those two calls are the whole stepper.
 

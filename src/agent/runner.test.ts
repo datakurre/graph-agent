@@ -869,7 +869,7 @@ describe("resume restores the Pi transcript (issue #115)", () => {
       streamFn: ((m: never, context: { messages: unknown[] }, o: never) => {
         requests.push({ messages: [...context.messages] });
         return faux.provider.streamSimple(m, context as never, o);
-      }) as RunSessionOptions["streamFn"],
+      }) as unknown as RunSessionOptions["streamFn"],
       sessionId: first.sessionId,
       onWait: () => ({ ok: "1" }),
     });
@@ -952,7 +952,7 @@ describe("checkpoints after every activity (issue #116)", () => {
       streamFn: ((m: never, context: { messages: unknown[] }, o: never) => {
         requests.push([...context.messages]);
         return faux2.provider.streamSimple(m, context as never, o);
-      }) as RunSessionOptions["streamFn"],
+      }) as unknown as RunSessionOptions["streamFn"],
       sessionId: "crashed",
     });
     expect(second.outcome).toBe("completed");

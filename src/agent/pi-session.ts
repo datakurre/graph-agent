@@ -120,7 +120,7 @@ export class PiSession {
       ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
       // The graph owns iteration: every run is exactly one turn, and the graph
       // decides whether there is another.
-      shouldStopAfterTurn: () => true,
+      finishTurn: async () => ({ action: "end" as const }),
       initialState: {
         systemPrompt: options.systemPrompt,
         model: options.model,
@@ -204,6 +204,11 @@ export class PiSession {
         };
       },
     } as unknown as AgentTool<any>;
+  }
+
+  /** Whether the transcript holds anything besides the leading system message(s). */
+  get hasConversation(): boolean {
+    return this.agent.state.messages.some((m) => m.role !== "system");
   }
 
   get messages(): AgentMessage[] {
@@ -376,7 +381,14 @@ export class PiSession {
    * into a single summary message, keeping the recent tail of messages.
    */
   compactHistory(keepRecent = 4, summaryNote?: string): { beforeCount: number; afterCount: number } {
-    const msgs = this.agent.state.messages;
+    // Pi >= 0.86 keeps the system prompt and tool declarations as leading
+    // `system` messages in the transcript; compaction must never summarize them
+    // away. Counts below cover the conversation only.
+    const all = this.agent.state.messages;
+    let systemEnd = 0;
+    while (all[systemEnd]?.role === "system") systemEnd++;
+    const system = all.slice(0, systemEnd);
+    const msgs = all.slice(systemEnd);
     if (msgs.length <= keepRecent + 1) {
       return { beforeCount: msgs.length, afterCount: msgs.length };
     }
@@ -419,8 +431,8 @@ export class PiSession {
     } as AgentMessage;
 
     this.compacted = true;
-    this.agent.state.messages = [summaryMsg, ...tail];
-    const afterCount = this.agent.state.messages.length;
+    this.agent.state.messages = [...system, summaryMsg, ...tail];
+    const afterCount = 1 + tail.length;
     return { beforeCount, afterCount };
   }
 }
