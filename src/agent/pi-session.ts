@@ -355,6 +355,20 @@ export class PiSession {
     };
   }
 
+  /**
+   * Declare the tool set for the turns that follow (issue #118). Assigning
+   * `agent.state.tools` between runs makes the Pi agent loop insert a `system`
+   * message carrying the `toolsAdded`/`toolsRemoved` diff, so the leading
+   * system message -- and the cached prefix -- stay untouched on models that
+   * support mid-conversation system messages.
+   */
+  setTools(specs: ToolSpec[]): void {
+    if (this.run && this.parked.size > 0) {
+      throw new Error("cannot change tools while tool calls are waiting for the graph");
+    }
+    this.agent.state.tools = specs.map((spec) => this.parkingTool(spec));
+  }
+
   /** Queue a message for the next turn boundary. */
   steer(text: string): void {
     this.agent.steer({ role: "user", content: text, timestamp: Date.now() } as AgentMessage);

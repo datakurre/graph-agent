@@ -186,3 +186,18 @@ it is not yet exercised end to end: `session-skeleton.bpmn` calls `craft_graph`
 through a `callActivity`, and bpmn-elements resolves `calledElement` only within
 the same definition, so the crafting graph still has to be spliced into the
 session at creation. Until then that call parks waiting for a signal.
+
+## Transcript system messages and mid-session tool changes
+
+Since pi-ai 0.86 the system prompt and tool declarations live in the transcript
+as a leading `{ role: "system" }` message. Assigning `agent.state.tools`
+between runs makes the agent loop append a later `system` message carrying a
+`toolsAdded`/`toolsRemoved` diff instead of rewriting the top of the request.
+Models with `supportsMidConvoSystemMessages` receive the change at that point
+in the transcript, so the cached prefix survives. Other models get the
+transcript collapsed, which costs a one-time cache miss rather than an error.
+
+graph-agent uses this in `drive()`: a session that starts on a graph with no
+`agent:tool` declares no tools, and when a splice later adds one, the splice
+re-entry calls `PiSession.setTools()` so the model can actually use it (#118).
+Splices are additive-only, so tools are only ever added.

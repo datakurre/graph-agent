@@ -389,3 +389,43 @@ describe("PiSession restored from a transcript with unanswered tool calls (issue
     expect(last.content[0].text).toContain("never executed");
   });
 });
+
+describe("PiSession.setTools (issue #118)", () => {
+  it("adds tools between turns without touching the leading system message", async () => {
+    const faux = scripted([fauxAssistantMessage([fauxText("one")]), fauxAssistantMessage([fauxText("two")])]);
+    const requests: Array<{ tools: string[]; system: unknown[] }> = [];
+    const pi = new PiSession({
+      model: faux.getModel(),
+      systemPrompt: "sys",
+      tools: [],
+      streamFn: (m, context, options) => {
+        const c = context as unknown as { tools?: Array<{ name: string }>; messages: Array<{ role: string; toolsAdded?: Array<{ name: string }> }> };
+        requests.push({
+          tools: (c.tools ?? []).map((t) => t.name),
+          system: c.messages.filter((x) => x.role === "system"),
+        });
+        return faux.provider.streamSimple(m, context, options);
+      },
+    });
+    await pi.beginTurn("hi");
+    await pi.endTurn();
+    const leading = pi.messages[0];
+    pi.setTools([{ name: "read", description: "Read.", parameters: { type: "object", additionalProperties: true } }]);
+    await pi.beginTurn("again");
+    await pi.endTurn();
+
+    expect(pi.messages[0]).toBe(leading);
+    const announced = pi.messages.filter(
+      (m, i) => i > 0 && m.role === "system" && JSON.stringify(m).includes("read"),
+    );
+    expect(announced).toHaveLength(1);
+    expect(pi.messages.indexOf(announced[0]!)).toBeGreaterThan(pi.messages.findIndex((m) => m.role === "assistant"));
+    expect(JSON.stringify(requests[1])).toContain("read");
+  });
+
+  it("refuses while tool calls are parked", async () => {
+    const { pi } = session([fauxAssistantMessage([fauxToolCall("read", {})])]);
+    await pi.beginTurn("go");
+    expect(() => pi.setTools([])).toThrow(/waiting for the graph/);
+  });
+});

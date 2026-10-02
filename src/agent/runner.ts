@@ -223,19 +223,23 @@ async function drive(
   const priorTranscript = store.readTranscript();
 
   // agent:tool is what actually runs a tool call the model asks for; a graph
-  // with no such activity anywhere has nowhere to send one. Pi's tool list is
-  // fixed for the whole session -- its prompt cache covers it, and changing
-  // tools mid-session would invalidate every turn's cache -- so this is
-  // decided once, up front, rather than per turn: a graph like craft-graph's
-  // draft_fragment otherwise offers the model four tools it can never
-  // actually run, and the model reaching for one wedges the run one activity
-  // downstream of the real cause, surfacing as "a turn is already in flight"
-  // on the *next* turn rather than naming the stuck call (issue #36). With no
-  // tools declared, Pi's request carries none at all, so the model has
-  // nothing to call in the first place -- this holds for the rest of the
-  // session even if a later splice adds an agent:tool activity, since the
-  // tool list itself cannot change without the same cache cost.
-  const canRunTools = graphOffersTools(graph);
+  // with no such activity anywhere has nowhere to send one. A graph like
+  // craft-graph's draft_fragment otherwise offers the model four tools it can
+  // never actually run, and the model reaching for one wedges the run one
+  // activity downstream of the real cause, surfacing as "a turn is already in
+  // flight" on the *next* turn rather than naming the stuck call (issue #36).
+  // With no tools declared, Pi's request carries none at all.
+  //
+  // This is decided up front but can flip once: if a later splice adds an
+  // agent:tool activity, the splice re-entry below declares the tools then
+  // (issue #118). Since Pi 0.86 the system prompt and tool set live in the
+  // transcript, so the change lands as a `system` message with a
+  // toolsAdded diff rather than rewriting the request's top-level tools
+  // field. On models with `supportsMidConvoSystemMessages` the cached prefix
+  // survives; other models get the transcript collapsed, which costs a
+  // one-time cache miss, never an error. Splices are additive-only, so tools
+  // are only ever added, never removed.
+  let canRunTools = graphOffersTools(graph);
 
   const pi = new PiSession({
     model: options.model,
@@ -369,6 +373,11 @@ async function drive(
       // both from disk before resuming (issue #75).
       const external = !splicedThisPass;
       graph = store.currentGraph() ?? graph;
+      if (!canRunTools && graphOffersTools(graph)) {
+        pi.setTools(options.tools.list());
+        canRunTools = true;
+        options.onProgress?.("  note: graph now offers tools; declared them to the model");
+      }
       splicedThisPass = false;
       revisionsAtPassStart = store.readMeta().revisions.length;
       const revisionIndex = revisionsAtPassStart - 1;

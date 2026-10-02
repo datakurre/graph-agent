@@ -961,3 +961,93 @@ describe("checkpoints after every activity (issue #116)", () => {
     expect(crashed.readTranscript().length).toBeGreaterThanOrEqual(6);
   });
 });
+
+describe("a splice that adds agent:tool enables tools mid-session (issue #118)", () => {
+  const NS =
+    'xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"';
+  const head = (tail: string, fromExtend: string) => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions id="Defs_late_tools" ${NS}>
+  <bpmn:process id="late_tools" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="draft" />
+    <bpmn:serviceTask id="draft" name="Draft">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="agent:turn" />
+        <zeebe:ioMapping>
+          <zeebe:input source="=prompt" target="prompt" />
+          <zeebe:output source="=text" target="fragment" />
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="draft" targetRef="extend" />
+    <bpmn:serviceTask id="extend" name="Extend">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="graph:extend" />
+        <zeebe:ioMapping><zeebe:input source="=fragment" target="fragment" /></zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="extend" targetRef="${fromExtend}" />
+    ${tail}
+  </bpmn:process>
+</bpmn:definitions>`;
+  const original = head(`<bpmn:endEvent id="end"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>`, "end");
+  const spliced = head(
+    `<bpmn:serviceTask id="ask" name="Ask">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="agent:turn" />
+        <zeebe:ioMapping><zeebe:input source="=&quot;now read a.ts&quot;" target="prompt" /></zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f3</bpmn:incoming><bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f4" sourceRef="ask" targetRef="run_tool" />
+    <bpmn:serviceTask id="run_tool" name="Run tool">
+      <bpmn:extensionElements><zeebe:taskDefinition type="agent:tool" /></bpmn:extensionElements>
+      <bpmn:incoming>f4</bpmn:incoming><bpmn:outgoing>f5</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f5" sourceRef="run_tool" targetRef="collect" />
+    <bpmn:serviceTask id="collect" name="Collect">
+      <bpmn:extensionElements><zeebe:taskDefinition type="agent:collect-tools" /></bpmn:extensionElements>
+      <bpmn:incoming>f5</bpmn:incoming><bpmn:outgoing>f6</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f6" sourceRef="collect" targetRef="end" />
+    <bpmn:endEvent id="end"><bpmn:incoming>f6</bpmn:incoming></bpmn:endEvent>`,
+    "ask",
+  );
+
+  it("declares the tools to the model on the turn after the splice, and routes its call", async () => {
+    const graphPath = join(home, "late_tools.bpmn");
+    writeFileSync(graphPath, original);
+    const faux = scripted([
+      fauxAssistantMessage([fauxText(spliced)], { stopReason: "stop" }),
+      fauxAssistantMessage([fauxToolCall("read", { path: "a.ts" })], { stopReason: "toolUse" }),
+    ]);
+    const declared: string[][] = [];
+    const progress: string[] = [];
+    const result = await runSession(
+      options(faux, {
+        graphPath,
+        project: home,
+        prompt: "splice in a tool step",
+        onProgress: (line: string) => progress.push(line),
+        streamFn: ((m: never, context: { tools?: Array<{ name: string }>; messages: Array<{ role: string; toolsAdded?: Array<{ name: string }> }> }, o: never) => {
+          declared.push([
+            ...(context.tools ?? []).map((t) => t.name),
+            ...context.messages.flatMap((msg) => (msg.role === "system" ? (msg.toolsAdded ?? []).map((t) => t.name) : [])),
+          ]);
+          return faux.provider.streamSimple(m, context as never, o);
+        }) as unknown as RunSessionOptions["streamFn"],
+      }),
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.outcome).toBe("completed");
+    expect(progress.join("\n")).toContain("graph now offers tools");
+    expect(declared[0]).toEqual([]);
+    expect(declared[1]).toContain("read");
+    const detail = new SessionStore(paths, result.sessionId).detail();
+    expect(detail.turns[1]?.toolCalls).toEqual(["read"]);
+    expect(detail.turns[1]?.toolCallDetails?.[0]?.result).toBeDefined();
+  });
+});
