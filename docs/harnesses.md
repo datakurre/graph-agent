@@ -170,6 +170,21 @@ job type has no template, and a second checks every existing template's
 together and drift between them fails fast rather than only against a real
 model (issue #54; issue #49 found the class of bug this closes).
 
+### Interrupted calls on recovery
+
+The session checkpoints after every harness activity, so a crash during
+`agent:tool` or `shell` is resumable. Before running, both record an in-flight
+marker in `meta.inflightTools`; the marker is removed when the call returns. A
+marker still present when the same call is dispatched again means the process
+died mid-call, and the call is **not** re-run blindly:
+
+- `agent:tool` re-runs only replay-safe tools (`read`, or whatever the
+  executor's `replaySafe(name)` declares). For anything else the model receives
+  an `isError` result saying the call was interrupted and may or may not have
+  taken effect, and decides for itself whether to retry.
+- `shell` runs a command the *graph* chose, so there is no model to tell: the
+  activity fails with a result naming the interrupted command.
+
 ## User tasks
 
 A `zeebe:userTask`'s answered form also has its `zeebe:ioMapping` output

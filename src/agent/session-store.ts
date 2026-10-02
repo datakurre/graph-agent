@@ -18,8 +18,22 @@ import type { Paths } from "./paths.ts";
  * crash can leave a revision with no engine state (recoverable by replaying to the
  * last snapshot) but never engine state referencing a graph that was never written.
  */
+export interface InflightTool {
+  name: string;
+  arguments: Record<string, unknown>;
+  activityId: string;
+  startedAt: number;
+}
+
 export interface SessionMeta {
   id: string;
+  /**
+   * Side-effecting calls whose intent was recorded before they ran (issue
+   * #117), keyed by tool call id (`shell:<activityId>` for the `shell`
+   * harness). An entry still present when the same call is dispatched again
+   * means the process died mid-call.
+   */
+  inflightTools?: Record<string, InflightTool>;
   name?: string;
   /** Absolute path of the project directory this session ran against. */
   project: string;

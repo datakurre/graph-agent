@@ -13,7 +13,15 @@ export interface ToolExecutor {
   /** Tools the model may call, with the schema it should be told about. */
   list(): ToolSpec[];
   run(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolOutcome>;
+  /**
+   * Whether re-running `name` after an interrupted attempt is harmless
+   * (issue #117). Defaults to membership in `REPLAY_SAFE_TOOLS`.
+   */
+  replaySafe?(name: string): boolean;
 }
+
+/** Tools with no side effect, so an interrupted call may simply run again. */
+export const REPLAY_SAFE_TOOLS: ReadonlySet<string> = new Set(["read"]);
 
 interface HarnessToolLike {
   name: string;
