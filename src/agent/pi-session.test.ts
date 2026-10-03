@@ -330,7 +330,7 @@ describe("PiSession", () => {
 });
 
 describe("PiSession restored from a transcript with unanswered tool calls (issue #115)", () => {
-  function restored(answeredIds: string[] = []) {
+  function restored(answeredIds: string[] = [], recover?: (id: string) => { content: string } | undefined) {
     const faux = scripted([fauxAssistantMessage([fauxText("done")], { stopReason: "stop" })]);
     const messages: any[] = [
       { role: "user", content: "go", timestamp: 1 },
@@ -361,6 +361,7 @@ describe("PiSession restored from a transcript with unanswered tool calls (issue
       ],
       streamFn: (m, context, options) => faux.provider.streamSimple(m, context, options),
       messages,
+      ...(recover ? { recoverToolResult: recover } : {}),
     });
     return pi;
   }
@@ -387,6 +388,32 @@ describe("PiSession restored from a transcript with unanswered tool calls (issue
     const last = pi.messages.at(-1) as any;
     expect(last.isError).toBe(true);
     expect(last.content[0].text).toContain("never executed");
+  });
+});
+
+describe("PiSession recovery of a call that ran before a crash (parallel batch)", () => {
+  it("answers a dangling call from the recorded outcome, not 'never executed'", async () => {
+    const faux = scripted([]);
+    const pi = new PiSession({
+      model: faux.getModel(),
+      systemPrompt: "sys",
+      tools: [{ name: "write", description: "w", parameters: { type: "object", additionalProperties: true } }],
+      streamFn: (m, context, options) => faux.provider.streamSimple(m, context, options),
+      messages: [
+        { role: "user", content: "go", timestamp: 1 },
+        {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "A", name: "write", arguments: {} }],
+          stopReason: "toolUse",
+          timestamp: 2,
+        },
+      ] as never,
+      recoverToolResult: (id) => (id === "A" ? { content: "wrote it" } : undefined),
+    });
+    await pi.endTurn();
+    const last = pi.messages.at(-1) as any;
+    expect(last.content[0].text).toBe("wrote it");
+    expect(last.isError).toBe(false);
   });
 });
 

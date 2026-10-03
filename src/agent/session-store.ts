@@ -34,6 +34,13 @@ export interface SessionMeta {
    * means the process died mid-call.
    */
   inflightTools?: Record<string, InflightTool>;
+  /**
+   * Outcomes of `agent:tool` calls finished in the current turn's batch, keyed
+   * by tool call id. Lets recovery answer a call that ran before a crash even
+   * though Pi had not yet written its result into the transcript. Cleared when
+   * the batch is collected.
+   */
+  toolOutcomes?: Record<string, { content: string; isError?: boolean; terminate?: boolean }>;
   name?: string;
   /** Absolute path of the project directory this session ran against. */
   project: string;
@@ -335,7 +342,7 @@ export class SessionStore {
    */
   writeTranscript(messages: readonly unknown[], options: { allowShrink?: boolean } = {}): void {
     mkdirSync(this.dir, { recursive: true });
-    const onDisk = this.readTranscript().length;
+    const onDisk = this.transcriptCount ?? this.countTranscript();
     if (messages.length < onDisk && options.allowShrink !== true) {
       throw new Error(
         `refusing to overwrite session.jsonl (${onDisk} messages) with a shorter transcript (${messages.length}): history would be lost`,
@@ -343,6 +350,17 @@ export class SessionStore {
     }
     const content = messages.map((m) => JSON.stringify(m)).join("\n") + (messages.length > 0 ? "\n" : "");
     writeAtomic(this.transcriptPath, content);
+    this.transcriptCount = messages.length;
+  }
+
+  /** Message count of session.jsonl, remembered after the first read or write. */
+  private transcriptCount: number | undefined;
+
+  private countTranscript(): number {
+    if (!existsSync(this.transcriptPath)) return 0;
+    let count = 0;
+    for (const line of readFileSync(this.transcriptPath, "utf8").split("\n")) if (line.length > 0) count++;
+    return count;
   }
 
   readTranscript(): unknown[] {

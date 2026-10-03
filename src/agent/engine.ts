@@ -252,6 +252,9 @@ function makeExtension(
             ),
             variables: { ...variables, ...sharedOutput, ...environment.output },
             ...(options.signal ? { signal: options.signal } : {}),
+            ...(typeof executionMessage.content?.index === "number"
+              ? { instance: String(executionMessage.content.index) }
+              : {}),
           };
 
           void callWithRetries(() => implementation(context), attempts).then(
@@ -466,8 +469,12 @@ async function drive(
   // definition, so one snapshot per event in parallel would interleave writes.
   let checkpointing: Promise<void> | null = null;
   let checkpointDirty = false;
+  // Set once the run has settled: a late activity.end (e.g. during the
+  // engine.stop() a splice triggers) must not start a checkpoint that could
+  // overwrite the caller's own final snapshot.
+  let checkpointsClosed = false;
   const scheduleCheckpoint = (): void => {
-    if (!options.onCheckpoint) return;
+    if (!options.onCheckpoint || checkpointsClosed) return;
     if (checkpointing) {
       checkpointDirty = true;
       return;
@@ -605,6 +612,7 @@ async function drive(
     await start(listener);
     const outcome = await Promise.race([ended, stopped, errored, hangGuard]);
     clearTimeout(hangGuardTimer);
+    checkpointsClosed = true;
     await checkpointing;
     return {
       outcome,
@@ -620,6 +628,7 @@ async function drive(
     };
   } catch (error) {
     clearTimeout(hangGuardTimer);
+    checkpointsClosed = true;
     await checkpointing;
     // `engine.waitFor("error")` resolves on the first error event and we return
     // right away, but nothing else here ever told the engine to stop -- so

@@ -80,6 +80,8 @@ export interface PiSessionOptions {
    * wants.
    */
   messages?: AgentMessage[];
+  /** The outcome the graph already recorded for a tool call, if it ran before a restart. */
+  recoverToolResult?: (toolCallId: string) => ToolOutcome | undefined;
 }
 
 interface Parked {
@@ -103,18 +105,20 @@ export class PiSession {
   private lastBatch: ToolOutcome[] = [];
   /** Wakes beginTurn once every tool call of the current turn has parked. */
   private onParked: (() => void) | null = null;
+  /** Set once compactHistory has deliberately shortened the transcript. */
+  compacted = false;
   /**
    * Tool calls of a restored transcript's last assistant message that have no
    * result yet: the session was parked between `agent:turn` and `agent:tool`.
    * There is no live run holding them, so they are answered by appending the
    * `toolResult` straight into the transcript.
    */
-  /** Set once compactHistory has deliberately shortened the transcript. */
-  compacted = false;
   private readonly dangling = new Map<string, string>();
   private readonly danglingAnswered = new Set<string>();
+  private readonly recoverToolResult: PiSessionOptions["recoverToolResult"];
 
   constructor(options: PiSessionOptions) {
+    this.recoverToolResult = options.recoverToolResult;
     this.agent = new Agent({
       streamFn: options.streamFn,
       ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
@@ -175,7 +179,14 @@ export class PiSession {
 
   private failDangling(): void {
     for (const id of [...this.dangling.keys()]) {
-      this.answerDangling(id, { content: `Tool call ${id} was never executed by the graph.`, isError: true });
+      // Pi adds a parallel batch's results to the transcript only once every
+      // call has resolved, so a call that already ran before a crash can still
+      // be dangling here. Prefer the outcome the graph recorded for it.
+      const recorded = this.recoverToolResult?.(id);
+      this.answerDangling(
+        id,
+        recorded ?? { content: `Tool call ${id} was never executed by the graph.`, isError: true },
+      );
     }
   }
 

@@ -527,6 +527,14 @@ export function createHarnesses(deps: HarnessDeps): HarnessRegistry {
     if (store && typeof store.update === "function") {
       store.update((meta) => {
         clearInflight(meta, call.id);
+        meta.toolOutcomes = {
+          ...meta.toolOutcomes,
+          [call.id]: {
+            content: outcome.content,
+            ...(outcome.isError === true ? { isError: true } : {}),
+            ...(outcome.terminate === true ? { terminate: true } : {}),
+          },
+        };
         const lastTurn = meta.turns[meta.turns.length - 1];
         if (lastTurn?.toolCallDetails) {
           const detail = lastTurn.toolCallDetails.find((d) => d.id === call.id || (d.name === call.name && !d.result));
@@ -559,6 +567,9 @@ export function createHarnesses(deps: HarnessDeps): HarnessRegistry {
   const finishTurn = async (summary: string): Promise<HarnessResult> => {
     const end = await pi.endTurn();
     currentToolCalls = [];
+    store?.update?.((meta) => {
+      delete meta.toolOutcomes;
+    });
     return ok(summary, { batch_terminate: end.terminate, tool_results: end.toolResults });
   };
 
@@ -934,9 +945,9 @@ export function createHarnesses(deps: HarnessDeps): HarnessRegistry {
       // Intent is recorded before the command runs (issue #117): the graph chose
       // this command, so there is no model to hand an "interrupted" result to --
       // a re-entry that finds the marker fails the activity instead of re-running.
-      const markerKey = `shell:${context.activityId}`;
+      const markerKey = `shell:${context.activityId}${context.instance === undefined ? "" : `#${context.instance}`}`;
       if (store?.readMeta?.().inflightTools?.[markerKey] !== undefined) {
-        store.update((meta) => {
+        store.update?.((meta) => {
           clearInflight(meta, markerKey);
         });
         return failed(

@@ -251,6 +251,7 @@ async function drive(
     // the model sees what was said before the gate and the final
     // writeTranscript below rewrites a superset of the file (issue #115).
     messages: priorTranscript as AgentMessage[],
+    recoverToolResult: (id) => store.readMeta().toolOutcomes?.[id],
   });
   options.onSessionReady?.(pi);
 
@@ -449,9 +450,19 @@ async function drive(
   const error =
     outcome !== "error" ? undefined : result.error?.message ? result.error : new Error(fallbackMessage);
 
-  store.writeEngineState(result.state);
-  if (pi.messages.length > 0 || priorTranscript.length > 0) {
-    store.writeTranscript(pi.messages, { allowShrink: pi.compacted });
+  // Transcript first, then engine state (see the header): a refused or failed
+  // write must not leave a newer snapshot pointing at an older transcript, and
+  // must surface as an error on the session instead of escaping as a bare throw
+  // with meta stuck on "running".
+  let persistError: Error | undefined;
+  try {
+    if (pi.messages.length > 0 || priorTranscript.length > 0) {
+      store.writeTranscript(pi.messages, { allowShrink: pi.compacted });
+    }
+    store.writeEngineState(result.state);
+  } catch (caught) {
+    persistError = caught instanceof Error ? caught : new Error(String(caught));
+    debugLogError("persisting the session failed", caught);
   }
   // A terminal "completed" status is never written backwards. resumeSession
   // already refuses to even start against a completed session, but this is
@@ -461,6 +472,12 @@ async function drive(
   const alreadyCompleted = meta.status === "completed";
   const dispatchedNothing = result.activities.length === 0;
   store.update((meta) => {
+    if (persistError) {
+      meta.status = "error";
+      meta.harnessError = persistError.message;
+      delete meta.pid;
+      return;
+    }
     if (alreadyCompleted && dispatchedNothing && outcome !== "completed") {
       delete meta.pid;
       return;
@@ -478,8 +495,8 @@ async function drive(
 
   return {
     sessionId: store.id,
-    outcome,
+    outcome: persistError ? "error" : outcome,
     turns: store.readMeta().turns.length,
-    ...(error === undefined ? {} : { error }),
+    ...(persistError ? { error: persistError } : error === undefined ? {} : { error }),
   };
 }

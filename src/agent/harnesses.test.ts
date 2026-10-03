@@ -738,11 +738,12 @@ describe("replay safety for interrupted calls (issue #117)", () => {
     expect(ran).toEqual(["read"]);
   });
 
-  it("leaves no marker behind after a normal call", async () => {
+  it("leaves no marker behind after a normal call, and records its outcome for recovery", async () => {
     const { store, ran, call } = setup();
     await call("bash");
     expect(ran).toEqual(["bash"]);
     expect(store.readMeta().inflightTools).toBeUndefined();
+    expect(store.readMeta().toolOutcomes?.c1?.content).toBe("ran");
   });
 
   it("fails an interrupted shell step naming the command instead of re-running it", async () => {
