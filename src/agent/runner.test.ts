@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, beforeEach } from "vitest";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
@@ -811,5 +811,243 @@ describe("steering and follow-up queues (issue #48)", () => {
     expect(result.turns).toBe(2);
     // Drained, not left behind for the next run to see again.
     expect(store.drainInbox("follow-up")).toEqual([]);
+  });
+});
+
+describe("resume restores the Pi transcript (issue #115)", () => {
+  const NS =
+    'xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"';
+  const gated = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions id="Defs_gated" ${NS}>
+  <bpmn:process id="gated" isExecutable="true">
+    <bpmn:extensionElements>
+      <zeebe:userTaskForm id="gate_form">{"components":[{"key":"ok","type":"textfield"}]}</zeebe:userTaskForm>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="turn1" />
+    <bpmn:serviceTask id="turn1"><bpmn:extensionElements><zeebe:taskDefinition type="agent:turn" />
+      <zeebe:ioMapping><zeebe:input source="=prompt" target="prompt" /></zeebe:ioMapping></bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="turn1" targetRef="gate" />
+    <bpmn:userTask id="gate" name="Gate"><bpmn:extensionElements><zeebe:userTask />
+      <zeebe:formDefinition formId="gate_form" /></bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing></bpmn:userTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="gate" targetRef="turn2" />
+    <bpmn:serviceTask id="turn2"><bpmn:extensionElements><zeebe:taskDefinition type="agent:turn" />
+      <zeebe:ioMapping><zeebe:input source="=&quot;second prompt&quot;" target="prompt" /></zeebe:ioMapping></bpmn:extensionElements>
+      <bpmn:incoming>f3</bpmn:incoming><bpmn:outgoing>f4</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f4" sourceRef="turn2" targetRef="end" />
+    <bpmn:endEvent id="end"><bpmn:incoming>f4</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+  function userTexts(messages: unknown[]): string[] {
+    return (messages as Array<{ role: string; content: unknown }>)
+      .filter((m) => m.role === "user")
+      .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)));
+  }
+
+  it("shows the model what was said before the gate, and keeps it on disk", async () => {
+    const graphPath = join(home, "gated.bpmn");
+    writeFileSync(graphPath, gated);
+
+    const first = await runSession(
+      options(scripted([fauxAssistantMessage([fauxText("one")], { stopReason: "stop" })]), {
+        graphPath,
+        prompt: "first prompt",
+        hangGuardMs: 50,
+      }),
+    );
+    expect(first.outcome).toBe("stopped");
+    const store = new SessionStore(paths, first.sessionId);
+    expect(userTexts(store.readTranscript())).toEqual(["first prompt"]);
+
+    const requests: Array<{ messages: unknown[] }> = [];
+    const faux = scripted([fauxAssistantMessage([fauxText("two")], { stopReason: "stop" })]);
+    const second = await resumeSession({
+      ...options(faux, { hangGuardMs: 50 }),
+      streamFn: ((m: never, context: { messages: unknown[] }, o: never) => {
+        requests.push({ messages: [...context.messages] });
+        return faux.provider.streamSimple(m, context as never, o);
+      }) as unknown as RunSessionOptions["streamFn"],
+      sessionId: first.sessionId,
+      onWait: () => ({ ok: "1" }),
+    });
+    expect(second.outcome).toBe("completed");
+
+    expect(userTexts(requests[0]!.messages).join("|")).toContain("first prompt");
+    expect(userTexts(store.readTranscript())).toEqual(["first prompt", "second prompt"]);
+  });
+
+  it("writeTranscript refuses to write less than is on disk", () => {
+    const store = new SessionStore(paths, "shrink");
+    store.create(project);
+    store.writeTranscript([{ role: "user", content: "a" }, { role: "user", content: "b" }]);
+    expect(() => store.writeTranscript([{ role: "user", content: "b" }])).toThrow(/refusing to overwrite/);
+  });
+});
+
+describe("checkpoints after every activity (issue #116)", () => {
+  const NS =
+    'xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"';
+  const turn = (id: string, prompt: string, from: string, to: string) =>
+    `<bpmn:serviceTask id="${id}"><bpmn:extensionElements><zeebe:taskDefinition type="agent:turn" />
+      <zeebe:ioMapping><zeebe:input source="=&quot;${prompt}&quot;" target="prompt" /></zeebe:ioMapping></bpmn:extensionElements>
+      <bpmn:incoming>${from}</bpmn:incoming><bpmn:outgoing>${to}</bpmn:outgoing></bpmn:serviceTask>`;
+  const three = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions id="Defs_three" ${NS}>
+  <bpmn:process id="three" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="turn1" />
+    ${turn("turn1", "p1", "f1", "f2")}
+    <bpmn:sequenceFlow id="f2" sourceRef="turn1" targetRef="turn2" />
+    ${turn("turn2", "p2", "f2", "f3")}
+    <bpmn:sequenceFlow id="f3" sourceRef="turn2" targetRef="turn3" />
+    ${turn("turn3", "p3", "f3", "f4")}
+    <bpmn:sequenceFlow id="f4" sourceRef="turn3" targetRef="end" />
+    <bpmn:endEvent id="end"><bpmn:incoming>f4</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+  it("has turn1 on disk while turn2 runs, and a snapshot from then resumes without re-sending turn1", async () => {
+    const graphPath = join(home, "three.bpmn");
+    writeFileSync(graphPath, three);
+    const say = (t: string) => fauxAssistantMessage([fauxText(t)], { stopReason: "stop" });
+    let snapshot: { id: string } | undefined;
+    let onDisk: { transcript: number; state: boolean } | undefined;
+    const faux = scripted([say("a"), say("b"), say("c")]);
+    const first = await runSession(
+      options(faux, {
+        graphPath,
+        prompt: "go",
+        onActivity: (a: { activityId: string }) => {
+          if (a.activityId !== "turn2") return;
+          const sid = readdirSync(paths.sessionsDir)[0]!;
+          const dir = join(paths.sessionsDir, sid);
+          onDisk = {
+            transcript: new SessionStore(paths, sid).readTranscript().length,
+            state: existsSync(join(dir, "engine.json")),
+          };
+          const copy = join(paths.sessionsDir, "crashed");
+          cpSync(dir, copy, { recursive: true });
+          snapshot = { id: "crashed" };
+        },
+      }),
+    );
+    expect(first.outcome).toBe("completed");
+    // user + assistant of turn1 at minimum
+    expect(onDisk?.transcript).toBeGreaterThanOrEqual(2);
+    expect(onDisk?.state).toBe(true);
+
+    const crashed = new SessionStore(paths, snapshot!.id);
+    crashed.update((m) => {
+      m.id = "crashed";
+      m.status = "running";
+      m.pid = 2 ** 22 - 1;
+    });
+    const requests: unknown[][] = [];
+    const faux2 = scripted([say("b2"), say("c2")]);
+    const second = await resumeSession({
+      ...options(faux2),
+      streamFn: ((m: never, context: { messages: unknown[] }, o: never) => {
+        requests.push([...context.messages]);
+        return faux2.provider.streamSimple(m, context as never, o);
+      }) as unknown as RunSessionOptions["streamFn"],
+      sessionId: "crashed",
+    });
+    expect(second.outcome).toBe("completed");
+    // Only the turns after the checkpoint were sent (turn1 was not re-run).
+    expect(requests.length).toBeLessThanOrEqual(2);
+    expect(crashed.readTranscript().length).toBeGreaterThanOrEqual(6);
+  });
+});
+
+describe("a splice that adds agent:tool enables tools mid-session (issue #118)", () => {
+  const NS =
+    'xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"';
+  const head = (tail: string, fromExtend: string) => `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions id="Defs_late_tools" ${NS}>
+  <bpmn:process id="late_tools" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="draft" />
+    <bpmn:serviceTask id="draft" name="Draft">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="agent:turn" />
+        <zeebe:ioMapping>
+          <zeebe:input source="=prompt" target="prompt" />
+          <zeebe:output source="=text" target="fragment" />
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="draft" targetRef="extend" />
+    <bpmn:serviceTask id="extend" name="Extend">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="graph:extend" />
+        <zeebe:ioMapping><zeebe:input source="=fragment" target="fragment" /></zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="extend" targetRef="${fromExtend}" />
+    ${tail}
+  </bpmn:process>
+</bpmn:definitions>`;
+  const original = head(`<bpmn:endEvent id="end"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>`, "end");
+  const spliced = head(
+    `<bpmn:serviceTask id="ask" name="Ask">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="agent:turn" />
+        <zeebe:ioMapping><zeebe:input source="=&quot;now read a.ts&quot;" target="prompt" /></zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f3</bpmn:incoming><bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f4" sourceRef="ask" targetRef="run_tool" />
+    <bpmn:serviceTask id="run_tool" name="Run tool">
+      <bpmn:extensionElements><zeebe:taskDefinition type="agent:tool" /></bpmn:extensionElements>
+      <bpmn:incoming>f4</bpmn:incoming><bpmn:outgoing>f5</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f5" sourceRef="run_tool" targetRef="collect" />
+    <bpmn:serviceTask id="collect" name="Collect">
+      <bpmn:extensionElements><zeebe:taskDefinition type="agent:collect-tools" /></bpmn:extensionElements>
+      <bpmn:incoming>f5</bpmn:incoming><bpmn:outgoing>f6</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f6" sourceRef="collect" targetRef="end" />
+    <bpmn:endEvent id="end"><bpmn:incoming>f6</bpmn:incoming></bpmn:endEvent>`,
+    "ask",
+  );
+
+  it("declares the tools to the model on the turn after the splice, and routes its call", async () => {
+    const graphPath = join(home, "late_tools.bpmn");
+    writeFileSync(graphPath, original);
+    const faux = scripted([
+      fauxAssistantMessage([fauxText(spliced)], { stopReason: "stop" }),
+      fauxAssistantMessage([fauxToolCall("read", { path: "a.ts" })], { stopReason: "toolUse" }),
+    ]);
+    const declared: string[][] = [];
+    const progress: string[] = [];
+    const result = await runSession(
+      options(faux, {
+        graphPath,
+        project: home,
+        prompt: "splice in a tool step",
+        onProgress: (line: string) => progress.push(line),
+        streamFn: ((m: never, context: { tools?: Array<{ name: string }>; messages: Array<{ role: string; toolsAdded?: Array<{ name: string }> }> }, o: never) => {
+          declared.push([
+            ...(context.tools ?? []).map((t) => t.name),
+            ...context.messages.flatMap((msg) => (msg.role === "system" ? (msg.toolsAdded ?? []).map((t) => t.name) : [])),
+          ]);
+          return faux.provider.streamSimple(m, context as never, o);
+        }) as unknown as RunSessionOptions["streamFn"],
+      }),
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.outcome).toBe("completed");
+    expect(progress.join("\n")).toContain("graph now offers tools");
+    expect(declared[0]).toEqual([]);
+    expect(declared[1]).toContain("read");
+    const detail = new SessionStore(paths, result.sessionId).detail();
+    expect(detail.turns[1]?.toolCalls).toEqual(["read"]);
+    expect(detail.turns[1]?.toolCallDetails?.[0]?.result).toBeDefined();
   });
 });

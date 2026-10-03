@@ -101,7 +101,7 @@ describe("PiSession", () => {
 
     expect(second.text).toBe("Done.");
     const roles = pi.messages.map((m) => (m as { role: string }).role);
-    expect(roles).toEqual(["user", "assistant", "toolResult", "assistant"]);
+    expect(roles).toEqual(["system", "user", "assistant", "toolResult", "assistant"]);
   });
 
   it("keeps the prompt cache warm across turns, which is the whole point", async () => {
@@ -224,14 +224,51 @@ describe("PiSession", () => {
     await pi.beginTurn("Turn 4");
     await pi.endTurn();
 
-    const before = pi.messages.length;
+    const system = pi.messages[0];
+    expect(system?.role).toBe("system");
+    const before = pi.messages.length - 1;
     expect(before).toBeGreaterThan(4);
 
     const res = pi.compactHistory(2);
     expect(res.beforeCount).toBe(before);
     expect(res.afterCount).toBeLessThan(before);
-    expect(pi.messages[0]?.role).toBe("user");
-    expect(String((pi.messages[0] as { content?: string })?.content)).toContain("Compacted conversation history");
+    // The system prompt + tool declarations survive; the summary follows them.
+    expect(pi.messages[0]).toBe(system);
+    expect(pi.agent.state.systemPrompt).toBe("You are a test agent.");
+    expect(pi.messages[1]?.role).toBe("user");
+    expect(String((pi.messages[1] as { content?: string })?.content)).toContain("Compacted conversation history");
+  });
+
+  it("still declares its tools to the model after compaction", async () => {
+    const faux = scripted([
+      fauxAssistantMessage([fauxText("1")]),
+      fauxAssistantMessage([fauxText("2")]),
+      fauxAssistantMessage([fauxText("3")]),
+      fauxAssistantMessage([fauxText("4")]),
+    ]);
+    const seen: Array<{ tools: string[] }> = [];
+    const pi = new PiSession({
+      model: faux.getModel(),
+      systemPrompt: "You are a test agent.",
+      tools: [{ name: "read", description: "Read.", parameters: { type: "object", additionalProperties: true } }],
+      streamFn: (m, context, options) => {
+        const c = context as unknown as { tools?: Array<{ name: string }>; messages: Array<{ role: string; toolsAdded?: Array<{ name: string }> }> };
+        const declared = [
+          ...(c.tools ?? []).map((t) => t.name),
+          ...c.messages.flatMap((msg) => (msg.role === "system" ? (msg.toolsAdded ?? []).map((t) => t.name) : [])),
+        ];
+        seen.push({ tools: declared });
+        return faux.provider.streamSimple(m, context, options);
+      },
+    });
+    for (const p of ["a", "b", "c"]) {
+      await pi.beginTurn(p);
+      await pi.endTurn();
+    }
+    pi.compactHistory(2);
+    await pi.beginTurn("d");
+    await pi.endTurn();
+    expect(seen.at(-1)?.tools).toContain("read");
   });
 
   it("never leaves a toolResult as the first message after compaction (issue #85)", async () => {
@@ -259,6 +296,7 @@ describe("PiSession", () => {
 
     const roles = pi.messages.map((m) => (m as { role: string }).role);
     expect(roles).toEqual([
+      "system",
       "user",
       "assistant",
       "toolResult",
@@ -271,8 +309,9 @@ describe("PiSession", () => {
 
     pi.compactHistory();
 
-    expect(pi.messages[0]?.role).toBe("user");
-    expect(pi.messages[1]?.role).not.toBe("toolResult");
+    expect(pi.messages[0]?.role).toBe("system");
+    expect(pi.messages[1]?.role).toBe("user");
+    expect(pi.messages[2]?.role).not.toBe("toolResult");
     // Every remaining toolResult still has its tool_use in the same (tail)
     // half of the transcript -- not buried inside the summary message.
     const toolUseIds = new Set(
@@ -287,5 +326,133 @@ describe("PiSession", () => {
         expect(toolUseIds.has((m as { toolCallId: string }).toolCallId)).toBe(true);
       }
     }
+  });
+});
+
+describe("PiSession restored from a transcript with unanswered tool calls (issue #115)", () => {
+  function restored(answeredIds: string[] = [], recover?: (id: string) => { content: string } | undefined) {
+    const faux = scripted([fauxAssistantMessage([fauxText("done")], { stopReason: "stop" })]);
+    const messages: any[] = [
+      { role: "user", content: "go", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "c1", name: "read", arguments: { path: "a" } },
+          { type: "toolCall", id: "c2", name: "bash", arguments: { command: "ls" } },
+        ],
+        stopReason: "toolUse",
+        timestamp: 2,
+      },
+      ...answeredIds.map((id) => ({
+        role: "toolResult",
+        toolCallId: id,
+        toolName: "read",
+        content: [{ type: "text", text: "earlier" }],
+        isError: false,
+        timestamp: 3,
+      })),
+    ];
+    const pi = new PiSession({
+      model: faux.getModel(),
+      systemPrompt: "sys",
+      tools: [
+        { name: "read", description: "r", parameters: { type: "object", additionalProperties: true } },
+        { name: "bash", description: "b", parameters: { type: "object", additionalProperties: true } },
+      ],
+      streamFn: (m, context, options) => faux.provider.streamSimple(m, context, options),
+      messages,
+      ...(recover ? { recoverToolResult: recover } : {}),
+    });
+    return pi;
+  }
+
+  it("lists dangling ids, answers both, and continues", async () => {
+    const pi = restored();
+    expect(pi.pendingToolCalls.sort()).toEqual(["c1", "c2"]);
+    pi.resolveTool("c1", { content: "A" });
+    pi.resolveTool("c2", { content: "B", isError: true });
+    expect(pi.pendingToolCalls).toEqual([]);
+    const end = await pi.endTurn();
+    expect(end.toolResults).toBe(2);
+    expect(pi.messages.filter((m) => m.role === "toolResult")).toHaveLength(2);
+    const turn = await pi.beginTurn();
+    expect(turn.text).toBe("done");
+    await pi.endTurn();
+  });
+
+  it("fails a never-answered dangling call and only lists the unanswered one", async () => {
+    const pi = restored(["c1"]);
+    expect(pi.pendingToolCalls).toEqual(["c2"]);
+    const end = await pi.endTurn();
+    expect(end.toolResults).toBe(1);
+    const last = pi.messages.at(-1) as any;
+    expect(last.isError).toBe(true);
+    expect(last.content[0].text).toContain("never executed");
+  });
+});
+
+describe("PiSession recovery of a call that ran before a crash (parallel batch)", () => {
+  it("answers a dangling call from the recorded outcome, not 'never executed'", async () => {
+    const faux = scripted([]);
+    const pi = new PiSession({
+      model: faux.getModel(),
+      systemPrompt: "sys",
+      tools: [{ name: "write", description: "w", parameters: { type: "object", additionalProperties: true } }],
+      streamFn: (m, context, options) => faux.provider.streamSimple(m, context, options),
+      messages: [
+        { role: "user", content: "go", timestamp: 1 },
+        {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "A", name: "write", arguments: {} }],
+          stopReason: "toolUse",
+          timestamp: 2,
+        },
+      ] as never,
+      recoverToolResult: (id) => (id === "A" ? { content: "wrote it" } : undefined),
+    });
+    await pi.endTurn();
+    const last = pi.messages.at(-1) as any;
+    expect(last.content[0].text).toBe("wrote it");
+    expect(last.isError).toBe(false);
+  });
+});
+
+describe("PiSession.setTools (issue #118)", () => {
+  it("adds tools between turns without touching the leading system message", async () => {
+    const faux = scripted([fauxAssistantMessage([fauxText("one")]), fauxAssistantMessage([fauxText("two")])]);
+    const requests: Array<{ tools: string[]; system: unknown[] }> = [];
+    const pi = new PiSession({
+      model: faux.getModel(),
+      systemPrompt: "sys",
+      tools: [],
+      streamFn: (m, context, options) => {
+        const c = context as unknown as { tools?: Array<{ name: string }>; messages: Array<{ role: string; toolsAdded?: Array<{ name: string }> }> };
+        requests.push({
+          tools: (c.tools ?? []).map((t) => t.name),
+          system: c.messages.filter((x) => x.role === "system"),
+        });
+        return faux.provider.streamSimple(m, context, options);
+      },
+    });
+    await pi.beginTurn("hi");
+    await pi.endTurn();
+    const leading = pi.messages[0];
+    pi.setTools([{ name: "read", description: "Read.", parameters: { type: "object", additionalProperties: true } }]);
+    await pi.beginTurn("again");
+    await pi.endTurn();
+
+    expect(pi.messages[0]).toBe(leading);
+    const announced = pi.messages.filter(
+      (m, i) => i > 0 && m.role === "system" && JSON.stringify(m).includes("read"),
+    );
+    expect(announced).toHaveLength(1);
+    expect(pi.messages.indexOf(announced[0]!)).toBeGreaterThan(pi.messages.findIndex((m) => m.role === "assistant"));
+    expect(JSON.stringify(requests[1])).toContain("read");
+  });
+
+  it("refuses while tool calls are parked", async () => {
+    const { pi } = session([fauxAssistantMessage([fauxToolCall("read", {})])]);
+    await pi.beginTurn("go");
+    expect(() => pi.setTools([])).toThrow(/waiting for the graph/);
   });
 });

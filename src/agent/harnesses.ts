@@ -9,8 +9,8 @@ import { spawn } from "node:child_process";
 import { layoutProcess } from "../js/lib/bpmn-auto-layout.ts";
 import { applyGraphOps, checkSplice, type GraphOp, type HarnessIOContract } from "./graph.ts";
 import { failed, HARNESS_RESULT_BASE_FIELDS, ok, type Harness, type HarnessRegistry, type HarnessResult } from "./harness.ts";
-import type { PiSession, ToolCallRequest } from "./pi-session.ts";
-import type { ToolExecutor } from "./tool-executor.ts";
+import type { PiSession, ToolCallRequest, ToolOutcome } from "./pi-session.ts";
+import { REPLAY_SAFE_TOOLS, type ToolExecutor } from "./tool-executor.ts";
 import { GraphRevisionConflictError, type SessionStore } from "./session-store.ts";
 import type { TurnRecord } from "../studio/types.ts";
 import { SUPPORTED_ELEMENT_TYPES, SUPPORTED_EVENT_DEFINITIONS } from "../js/lib/supported-bpmn-elements.ts";
@@ -365,6 +365,12 @@ function recordStep(
   }
 }
 
+function clearInflight(meta: { inflightTools?: Record<string, unknown> }, key: string): void {
+  if (!meta.inflightTools) return;
+  delete meta.inflightTools[key];
+  if (Object.keys(meta.inflightTools).length === 0) delete meta.inflightTools;
+}
+
 export function createHarnesses(deps: HarnessDeps): HarnessRegistry {
   const { pi, tools, store } = deps;
   const cwd = deps.cwd ?? process.cwd();
@@ -389,7 +395,7 @@ export function createHarnesses(deps: HarnessDeps): HarnessRegistry {
   const agentTurn: Harness = async (context) => {
     const prompt = context.input.prompt;
     const raw = typeof prompt === "string" && prompt.length > 0 ? prompt : undefined;
-    if (raw === undefined && pi.messages.length === 0) {
+    if (raw === undefined && !pi.hasConversation) {
       return failed(
         `${context.activityId} starts a turn with nothing to say: map a 'prompt' input, ` +
           `or place it after an activity that has already spoken.`,
@@ -485,13 +491,50 @@ export function createHarnesses(deps: HarnessDeps): HarnessRegistry {
     if (!resolved.ok) return failed(resolved.reason);
     const call = resolved.call;
 
+    // Record intent before running (issue #117). A marker that is already there
+    // means a previous attempt of this very call died mid-flight.
+    const interrupted = store?.readMeta?.().inflightTools?.[call.id] !== undefined;
+    const replaySafe = tools.replaySafe ? tools.replaySafe(call.name) : REPLAY_SAFE_TOOLS.has(call.name);
     const toolStart = Date.now();
-    const outcome = await tools.run(call.name, call.arguments, context.signal);
+    let outcome: ToolOutcome;
+    if (interrupted && !replaySafe) {
+      outcome = {
+        content:
+          `Interrupted: graph-agent stopped while this ${call.name} call was running, so it may or may not have ` +
+          `taken effect. It was not re-run automatically. Check the current state before retrying.`,
+        isError: true,
+      };
+    } else {
+      store?.update?.((meta) => {
+        meta.inflightTools = {
+          ...meta.inflightTools,
+          [call.id]: { name: call.name, arguments: call.arguments, activityId: context.activityId, startedAt: toolStart },
+        };
+      });
+      try {
+        outcome = await tools.run(call.name, call.arguments, context.signal);
+      } catch (error) {
+        // Threw rather than crashed: the process is alive, so nothing is in flight.
+        store?.update?.((meta) => {
+          clearInflight(meta, call.id);
+        });
+        throw error;
+      }
+    }
     const durationMs = Date.now() - toolStart;
     pi.resolveTool(call.id, outcome);
 
     if (store && typeof store.update === "function") {
       store.update((meta) => {
+        clearInflight(meta, call.id);
+        meta.toolOutcomes = {
+          ...meta.toolOutcomes,
+          [call.id]: {
+            content: outcome.content,
+            ...(outcome.isError === true ? { isError: true } : {}),
+            ...(outcome.terminate === true ? { terminate: true } : {}),
+          },
+        };
         const lastTurn = meta.turns[meta.turns.length - 1];
         if (lastTurn?.toolCallDetails) {
           const detail = lastTurn.toolCallDetails.find((d) => d.id === call.id || (d.name === call.name && !d.result));
@@ -524,6 +567,9 @@ export function createHarnesses(deps: HarnessDeps): HarnessRegistry {
   const finishTurn = async (summary: string): Promise<HarnessResult> => {
     const end = await pi.endTurn();
     currentToolCalls = [];
+    store?.update?.((meta) => {
+      delete meta.toolOutcomes;
+    });
     return ok(summary, { batch_terminate: end.terminate, tool_results: end.toolResults });
   };
 
@@ -896,8 +942,35 @@ export function createHarnesses(deps: HarnessDeps): HarnessRegistry {
       if (!command) return failed("no 'command' header configured for this shell step");
       const failOnError = context.properties.fail_on_error !== "false";
 
+      // Intent is recorded before the command runs (issue #117): the graph chose
+      // this command, so there is no model to hand an "interrupted" result to --
+      // a re-entry that finds the marker fails the activity instead of re-running.
+      const markerKey = `shell:${context.activityId}${context.instance === undefined ? "" : `#${context.instance}`}`;
+      if (store?.readMeta?.().inflightTools?.[markerKey] !== undefined) {
+        store.update?.((meta) => {
+          clearInflight(meta, markerKey);
+        });
+        return failed(
+          `\`${command}\` was interrupted: graph-agent stopped while it was running, so it may or may not ` +
+            `have taken effect. It was not re-run automatically.`,
+        );
+      }
       const startedAt = Date.now();
-      const { exit_code, stdout, stderr } = await runCommand(command, cwd, context.signal);
+      store?.update?.((meta) => {
+        meta.inflightTools = {
+          ...meta.inflightTools,
+          [markerKey]: { name: "shell", arguments: { command }, activityId: context.activityId, startedAt },
+        };
+      });
+      let result: Awaited<ReturnType<typeof runCommand>>;
+      try {
+        result = await runCommand(command, cwd, context.signal);
+      } finally {
+        store?.update?.((meta) => {
+          clearInflight(meta, markerKey);
+        });
+      }
+      const { exit_code, stdout, stderr } = result;
       const endedAt = Date.now();
       const summary = `\`${command}\` exited ${exit_code}`;
       // `exit_code`, never `status`: HarnessResult already reserves `status` for

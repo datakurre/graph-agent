@@ -86,6 +86,18 @@ export interface RunnerOptions {
    * true end event without them.
    */
   checkStopAfterActivity?: () => boolean;
+  /**
+   * Called with a fresh engine snapshot after a harness-backed activity ends
+   * (issue #116), so a crash mid-pass loses at most the activity in flight.
+   * Calls are serialized and coalesced: at most one runs and one more is
+   * queued, and every call is settled before the run returns.
+   *
+   * Only harness-backed activities checkpoint -- they are the ones that cost
+   * money or have side effects; gateways and events are cheap to replay.
+   * Nothing is checkpointed *inside* a turn: an `agent:turn` that dies
+   * mid-stream is simply re-run on resume, which costs one turn.
+   */
+  onCheckpoint?: (state: EngineState) => void | Promise<void>;
 }
 
 export interface RunResult {
@@ -240,6 +252,9 @@ function makeExtension(
             ),
             variables: { ...variables, ...sharedOutput, ...environment.output },
             ...(options.signal ? { signal: options.signal } : {}),
+            ...(typeof executionMessage.content?.index === "number"
+              ? { instance: String(executionMessage.content.index) }
+              : {}),
           };
 
           void callWithRetries(() => implementation(context), attempts).then(
@@ -450,6 +465,38 @@ async function drive(
     if (api?.id) visited.add(api.id);
   });
 
+  // Serialize + coalesce checkpoints: getState() serializes the whole
+  // definition, so one snapshot per event in parallel would interleave writes.
+  let checkpointing: Promise<void> | null = null;
+  let checkpointDirty = false;
+  // Set once the run has settled: a late activity.end (e.g. during the
+  // engine.stop() a splice triggers) must not start a checkpoint that could
+  // overwrite the caller's own final snapshot.
+  let checkpointsClosed = false;
+  const scheduleCheckpoint = (): void => {
+    if (!options.onCheckpoint || checkpointsClosed) return;
+    if (checkpointing) {
+      checkpointDirty = true;
+      return;
+    }
+    checkpointing = (async () => {
+      try {
+        do {
+          checkpointDirty = false;
+          try {
+            await options.onCheckpoint?.(await engine.getState());
+          } catch (error) {
+            // A failed checkpoint must not take the run down with it; the
+            // end-of-pass write in runner.ts is still the authoritative one.
+            if (process.env.GRAPH_AGENT_DEBUG) console.error("checkpoint failed:", error);
+          }
+        } while (checkpointDirty);
+      } finally {
+        checkpointing = null;
+      }
+    })();
+  };
+
   const waitingConditionals = new Map<string, { signal?: (message?: unknown) => void }>();
 
   let stoppedForSplice = false;
@@ -466,6 +513,7 @@ async function drive(
       }
     }
     void options.onTokens?.(currentTokens(), [...visited]);
+    if (byId.has(api.id)) scheduleCheckpoint();
     if (options.checkStopAfterActivity?.()) {
       stoppedForSplice = true;
       void engine.stop();
@@ -564,6 +612,8 @@ async function drive(
     await start(listener);
     const outcome = await Promise.race([ended, stopped, errored, hangGuard]);
     clearTimeout(hangGuardTimer);
+    checkpointsClosed = true;
+    await checkpointing;
     return {
       outcome,
       state: await engine.getState(),
@@ -578,6 +628,8 @@ async function drive(
     };
   } catch (error) {
     clearTimeout(hangGuardTimer);
+    checkpointsClosed = true;
+    await checkpointing;
     // `engine.waitFor("error")` resolves on the first error event and we return
     // right away, but nothing else here ever told the engine to stop -- so
     // whatever kept running (a nested process mid-callActivity, chiefly: see

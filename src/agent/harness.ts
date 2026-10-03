@@ -28,6 +28,8 @@ export interface HarnessContext {
   /** Current process variables. */
   variables: Record<string, unknown>;
   signal?: AbortSignal;
+  /** Multi-instance loop index, so parallel instances of one activity can be told apart. */
+  instance?: string;
 }
 
 export type Harness = (context: HarnessContext) => Promise<HarnessResult>;

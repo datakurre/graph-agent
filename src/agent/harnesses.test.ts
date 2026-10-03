@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxProvider, fauxAssistantMessage, fauxText } from "@earendil-works/pi-ai";
@@ -677,5 +677,87 @@ describe("stripCodeFence", () => {
   it("returns raw text when no fences are present", () => {
     expect(stripCodeFence("[{\"op\":\"appendShape\"}]")).toBe("[{\"op\":\"appendShape\"}]");
     expect(stripCodeFence("")).toBe("");
+  });
+});
+
+describe("replay safety for interrupted calls (issue #117)", () => {
+  function setup(cwd?: string) {
+    const home = mkdtempSync(join(tmpdir(), "graph-agent-replay-"));
+    const paths = ensurePaths(
+      resolvePaths({ XDG_CONFIG_HOME: join(home, "c"), XDG_STATE_HOME: join(home, "s") } as NodeJS.ProcessEnv),
+    );
+    const store = new SessionStore(paths, "s1");
+    store.create("/tmp/some-project");
+    const resolved: Array<{ id: string; content: string; isError?: boolean }> = [];
+    const ran: string[] = [];
+    const registry = createHarnesses({
+      pi: {
+        pendingToolCalls: [],
+        resolveTool: (id: string, o: { content: string; isError?: boolean }) => resolved.push({ id, ...o }),
+      } as unknown as HarnessDeps["pi"],
+      tools: {
+        list: () => [],
+        run: async (name: string) => {
+          ran.push(name);
+          return { content: "ran" };
+        },
+      } as HarnessDeps["tools"],
+      store,
+      getGraph: () => "",
+      setGraph: () => {},
+      takeSteering: () => [],
+      takeFollowUp: () => [],
+      ...(cwd === undefined ? {} : { cwd }),
+    });
+    const call = (name: string) =>
+      registry["agent:tool"]!({
+        activityId: "tool",
+        harness: "agent:tool",
+        properties: {},
+        input: { tool_call: { id: "c1", name, arguments: {} } },
+        variables: {},
+      });
+    return { store, resolved, ran, call, registry };
+  }
+  const marker = { name: "x", arguments: {}, activityId: "tool", startedAt: 1 };
+
+  it("does not re-run an interrupted bash call; the model gets an interrupted error", async () => {
+    const { store, resolved, ran, call } = setup();
+    store.update((m) => (m.inflightTools = { c1: { ...marker, name: "bash" } }));
+    await call("bash");
+    expect(ran).toEqual([]);
+    expect(resolved[0]?.isError).toBe(true);
+    expect(resolved[0]?.content).toMatch(/Interrupted: .*bash.*not re-run/);
+    expect(store.readMeta().inflightTools).toBeUndefined();
+  });
+
+  it("re-runs an interrupted read", async () => {
+    const { store, ran, call } = setup();
+    store.update((m) => (m.inflightTools = { c1: { ...marker, name: "read" } }));
+    await call("read");
+    expect(ran).toEqual(["read"]);
+  });
+
+  it("leaves no marker behind after a normal call, and records its outcome for recovery", async () => {
+    const { store, ran, call } = setup();
+    await call("bash");
+    expect(ran).toEqual(["bash"]);
+    expect(store.readMeta().inflightTools).toBeUndefined();
+    expect(store.readMeta().toolOutcomes?.c1?.content).toBe("ran");
+  });
+
+  it("fails an interrupted shell step naming the command instead of re-running it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "graph-agent-replay-cwd-"));
+    const { store, registry } = setup(dir);
+    store.update((m) => (m.inflightTools = { "shell:run_it": { ...marker, name: "shell" } }));
+    const result = await registry.shell!(context({ command: "touch ran.txt" }));
+    expect(result.status).toBe("failed");
+    expect(String(result.summary)).toContain("touch ran.txt");
+    expect(existsSync(join(dir, "ran.txt"))).toBe(false);
+    expect(store.readMeta().inflightTools).toBeUndefined();
+    // the next attempt is a fresh one
+    const again = await registry.shell!(context({ command: "touch ran.txt" }));
+    expect(again.status).toBe("success");
+    expect(existsSync(join(dir, "ran.txt"))).toBe(true);
   });
 });

@@ -11,15 +11,36 @@ import type { Paths } from "./paths.ts";
  *     engine.json      bpmn-engine state snapshot (source stripped; see graph/)
  *     graph/000.bpmn   graph revisions, oldest first -- the session mutates, so
  *     graph/001.bpmn   every splice lands as a new revision rather than an overwrite
- *     session.jsonl    Pi's own transcript, written by Pi's SessionManager
+ *     session.jsonl    Pi's transcript, written by graph-agent (restored on resume)
  *
  * Ordering matters on write: the transcript is Pi's, the graph revision is ours,
  * and the engine snapshot points at both. Committing them in that order means a
  * crash can leave a revision with no engine state (recoverable by replaying to the
  * last snapshot) but never engine state referencing a graph that was never written.
  */
+export interface InflightTool {
+  name: string;
+  arguments: Record<string, unknown>;
+  activityId: string;
+  startedAt: number;
+}
+
 export interface SessionMeta {
   id: string;
+  /**
+   * Side-effecting calls whose intent was recorded before they ran (issue
+   * #117), keyed by tool call id (`shell:<activityId>` for the `shell`
+   * harness). An entry still present when the same call is dispatched again
+   * means the process died mid-call.
+   */
+  inflightTools?: Record<string, InflightTool>;
+  /**
+   * Outcomes of `agent:tool` calls finished in the current turn's batch, keyed
+   * by tool call id. Lets recovery answer a call that ran before a crash even
+   * though Pi had not yet written its result into the transcript. Cleared when
+   * the batch is collected.
+   */
+  toolOutcomes?: Record<string, { content: string; isError?: boolean; terminate?: boolean }>;
   name?: string;
   /** Absolute path of the project directory this session ran against. */
   project: string;
@@ -315,10 +336,31 @@ export class SessionStore {
     writeAtomic(this.enginePath, JSON.stringify(state));
   }
 
-  writeTranscript(messages: readonly unknown[]): void {
+  /**
+   * Never writes less than it reads (issue #115) unless the caller says the
+   * transcript was deliberately compacted.
+   */
+  writeTranscript(messages: readonly unknown[], options: { allowShrink?: boolean } = {}): void {
     mkdirSync(this.dir, { recursive: true });
+    const onDisk = this.transcriptCount ?? this.countTranscript();
+    if (messages.length < onDisk && options.allowShrink !== true) {
+      throw new Error(
+        `refusing to overwrite session.jsonl (${onDisk} messages) with a shorter transcript (${messages.length}): history would be lost`,
+      );
+    }
     const content = messages.map((m) => JSON.stringify(m)).join("\n") + (messages.length > 0 ? "\n" : "");
     writeAtomic(this.transcriptPath, content);
+    this.transcriptCount = messages.length;
+  }
+
+  /** Message count of session.jsonl, remembered after the first read or write. */
+  private transcriptCount: number | undefined;
+
+  private countTranscript(): number {
+    if (!existsSync(this.transcriptPath)) return 0;
+    let count = 0;
+    for (const line of readFileSync(this.transcriptPath, "utf8").split("\n")) if (line.length > 0) count++;
+    return count;
   }
 
   readTranscript(): unknown[] {
